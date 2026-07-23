@@ -86,67 +86,8 @@ python sign_params.py --sdk security_sdk.json
 - 封面：JPEG；可用 `--cover cover.jpg`，或不传则自动找「视频同路径同名 `.jpg`」
 
 ### 4. 发布
-
-```bash
-python publish.py ^
-  --video response.mp4 ^
-  --title Test ^
-  --cover cover.jpg ^
-  --cookie-file cookies.txt ^
-  --security-sdk security_sdk.json ^
-  --user-id 你的uid
-```
-
-Linux / macOS：
-
-```bash
-python publish.py \
-  --video response.mp4 \
-  --title Test \
-  --cover cover.jpg \
-  --cookie-file cookies.txt \
-  --security-sdk security_sdk.json \
-  --user-id 你的uid
-```
-
-成功时终端会打印 `item_id`，例如：
-
-```text
-[publish] ok item_id=7664856313289100587
-```
-
-带更多发布选项：
-
-```bash
-python publish.py ^
-  --video response.mp4 ^
-  --title Test ^
-  --caption "简介内容" ^
-  --hashtags 旅行,美食 ^
-  --visibility 0 ^
-  --download 1 ^
-  --timing 0 ^
-  --cover cover.jpg
-```
-
-## 命令行参数
-
-| 参数 | 必填 | 默认 | 说明 |
-|------|------|------|------|
-| `--video` | 是 | — | 视频文件路径 |
-| `--title` | 是 | — | 作品标题 |
-| `--caption` | 否 | 空 | 作品简介 |
-| `--hashtags` | 否 | 空 | 话题，逗号分隔 |
-| `--visibility` | 否 | 0 | 0公开 / 1好友可见 / 2仅自己可见 |
-| `--download` | 否 | 1 | 1允许保存 / 0不允许 |
-| `--timing` | 否 | 0 | 0立即发布，否则定时 Unix 秒 |
-| `--hot-sentence` | 否 | 空 | 关联热点 |
-| `--mix-id` | 否 | 空 | 合集 ID |
-| `--cover` | 否 | 同名 `.jpg` | 封面 JPEG |
-| `--cookie-file` | 否 | `cookies.txt` | Cookie 文件 |
-| `--security-sdk` | 否 | `security_sdk.json` | ticket-guard 密钥 |
-| `--user-id` | 否 | 自动探测 | 作者 uid |
-| `--options-json` | 否 | 空 | 额外 PublishOptions JSON 文件 |
+- 修改pulish.py中main方法中的参数
+- python publish.py
 
 ## 发布可配置参数（create_v2）
 
@@ -212,11 +153,6 @@ FileNotFoundError: 需要封面图 JPEG
 2. Cookie 与 sdk 是否同一账号、同一登录会话  
 3. 确认本机有 Node：`node -v`，日志里 `a_bogus=yes`  
 4. 可单独测：`node sign_a_bogus/sign.js --url "https://creator.douyin.com/web/api/media/aweme/create_v2/?aid=2906" --json`
-
-### 安全注意
-
-- `cookies.txt`、`security_sdk.json` 含登录态与私钥，**不要提交到 Git**（已在 `.gitignore`）
-- 不要分享给他人；泄露等于账号可被代发内容
 
 ## 相关脚本
 
