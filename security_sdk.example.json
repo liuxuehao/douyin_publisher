@@ -1,0 +1,18 @@
+# 从浏览器 Application -> Local Storage -> creator.douyin.com 导出：
+#   security-sdk/s_sdk_crypt_sdk          -> ec_privateKey / ec_publicKey
+#   security-sdk/s_sdk_sign_data_key/web_protect -> ticket / ts_sign / client_cert
+#
+# 或在已登录页面控制台执行：
+#   JSON.stringify({
+#     ...JSON.parse(JSON.parse(localStorage['security-sdk/s_sdk_crypt_sdk']).data),
+#     ...JSON.parse(JSON.parse(localStorage['security-sdk/s_sdk_sign_data_key/web_protect']).data),
+#   }, null, 2)
+#
+# 保存为 security_sdk.json（勿提交仓库）
+{
+  "ec_privateKey": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+  "ec_publicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+  "ticket": "hash.xxxx",
+  "ts_sign": "ts.2.xxxx",
+  "client_cert": "pub.xxxx"
+}

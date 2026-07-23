@@ -1,0 +1,10 @@
+﻿# Local secrets - do not commit
+cookies.txt
+cookies.json
+security_sdk.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.playwright-mcp/
+uploads/

@@ -1,0 +1,3 @@
+# Paste the Cookie header value from creator.douyin.com DevTools here (single line).
+# Required cookies typically include: sessionid, sid_tt, uid_tt, ttwid, csrf_session_id
+sessionid=YOUR_SESSIONID; sid_tt=YOUR_SID_TT; uid_tt=YOUR_UID_TT; ttwid=YOUR_TTWID; csrf_session_id=YOUR_CSRF_SESSION_ID
