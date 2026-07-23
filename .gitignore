@@ -2,6 +2,8 @@
 cookies.txt
 cookies.json
 security_sdk.json
+ms_token.txt
+mssdk_strdata.json
 __pycache__/
 *.pyc
 .venv/

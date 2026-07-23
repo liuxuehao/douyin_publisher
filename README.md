@@ -12,6 +12,8 @@ douyin_publish_interface/
 ├── sign_a_bogus/              # Node：跑 bdms.min.js 生成 a_bogus
 │   ├── env.js
 │   └── sign.js
+├── sign_mssdk/                # Node：bdms/sdk-glue 补环境抓 mssdk strData
+│   └── gen_strdata.js
 ├── requirements.txt
 ├── cookies.example.txt        # Cookie 模板
 ├── cookies.txt                # 你的登录 Cookie（勿提交）
@@ -19,15 +21,15 @@ douyin_publish_interface/
 ├── security_sdk.json          # EC 私钥 + ticket（勿提交）
 ├── cover.jpg                  # 封面图（JPEG）
 ├── response.mp4               # 待发布视频示例
-└── _reverse/                  # 逆向分析产物（bdms 等）
+└── _reverse/                  # 逆向分析产物（bdms / sdk-glue 等）
 ```
 
-> **说明：** 日常用 `python publish.py ...`。`a_bogus` 由本机 Node 调用 `sign_a_bogus/` 生成。
+> **说明：** 日常用 `python publish.py ...`。`a_bogus` / `msToken` 均由本机 Node 补环境生成，**不依赖 Playwright/Selenium**；`strData` 每次现场生成，无需配置 `mssdk_strdata.json`。
 
 ## 环境要求
 
 - Python 3.10+
-- Node.js 18+（用于生成 `a_bogus`，调用 `_reverse/bdms.min.js`）
+- Node.js 18+（`a_bogus` + `msToken`/`strData` 补环境，共用 `_reverse/bdms.min.js`）
 - 已登录的抖音创作者账号（浏览器 Cookie）
 
 ```bash
@@ -123,7 +125,7 @@ python sign_params.py --sdk security_sdk.json
 | 参数 | 是否已还原 | 用法 |
 |------|------------|------|
 | `bd-ticket-guard-*` | ✅ 纯 Python | 读 `security_sdk.json`，ECDSA 签 `ticket=&path=&timestamp=` |
-| `msToken` | ✅ 复用 | 从响应头 `x-ms-token` 自动续用 |
+| `msToken` | ✅ Node 补环境 + mssdk | `sign_mssdk/gen_strdata.js`（bdms/sdk-glue，无浏览器）产 `strData`；再 `POST /web/r/token` 换票；业务响应头续用 |
 | `x-secsdk-csrf-token` | ✅ 协议换取 | 请求时自动获取 |
 | `a_bogus` | ✅ Node + bdms | `sign_a_bogus/sign.js` 进程池；`DOUYIN_A_BOGUS=0` 关闭；`DOUYIN_A_BOGUS_WORKERS=N` 并发数（默认 2） |
 | `x-tt-session-dtrait` | 未实现 | 一般可先省略 |
@@ -151,8 +153,9 @@ FileNotFoundError: 需要封面图 JPEG
 
 1. 确认已传 `--security-sdk` 且文件有效  
 2. Cookie 与 sdk 是否同一账号、同一登录会话  
-3. 确认本机有 Node：`node -v`，日志里 `a_bogus=yes`  
-4. 可单独测：`node sign_a_bogus/sign.js --url "https://creator.douyin.com/web/api/media/aweme/create_v2/?aid=2906" --json`
+3. 确认本机有 Node：`node -v`，日志里 `a_bogus=yes`，且 init 日志 `msToken ready`  
+4. 缺 msToken：发布初始化默认每次 Node 现场生成 `strData` 再换票（不读本地 json；`DOUYIN_MSSDK_HARVEST=0` 可关闭）  
+5. 可单独测：`node sign_a_bogus/sign.js --url "https://creator.douyin.com/web/api/media/aweme/create_v2/?aid=2906" --json`
 
 ## 相关脚本
 

@@ -1,0 +1,11 @@
+{
+  "name": "sign_mssdk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Harvest Douyin creator mssdk strData via Node vm + bdms (no Playwright)",
+  "main": "gen_strdata.js",
+  "scripts": {
+    "gen": "node gen_strdata.js",
+    "gen:json": "node gen_strdata.js --json"
+  }
+}

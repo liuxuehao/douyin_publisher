@@ -249,7 +249,19 @@ class DouyinPublisher:
         )
         self.user_id = user_id
         self.csrf_token = ""
-        self.ms_token = MsTokenCache()
+        self.ms_token = MsTokenCache.from_sources()
+        if self.ms_token.refresh_from_mssdk(user_agent=UA, cookie=cookie):
+            _log(f"[init] msToken ready (fresh strData) len={len(self.ms_token.token)}")
+        elif self.ms_token.token:
+            _log(
+                f"[init] msToken seeded len={len(self.ms_token.token)} "
+                "(mssdk 刷新失败，沿用本地/环境变量)"
+            )
+        else:
+            _log(
+                "[init] msToken empty — create_v2 可能 403；"
+                "请确认 Node + _reverse/bdms.min.js，或设置 DOUYIN_MS_TOKEN"
+            )
         self.ticket_signer: Optional[TicketGuardSigner] = None
         material = security_material
         if material is None and security_sdk and security_sdk.is_file():
@@ -299,6 +311,7 @@ class DouyinPublisher:
                     "content-type",
                     "x-secsdk-csrf-token",
                     "bd-ticket-guard-version",
+                    "bd-ticket-guard-iteration-version",
                     "bd-ticket-guard-web-version",
                     "bd-ticket-guard-web-sign-type",
                     "bd-ticket-guard-client-data",
@@ -310,6 +323,73 @@ class DouyinPublisher:
                 _log(f"[{tag}] req_headers={interesting}")
         if LOG_VERBOSE and body_preview:
             _log(f"[{tag}] req_body={_clip(body_preview, 400)}")
+
+    def _dump_error_response(
+        self,
+        response: requests.Response,
+        tag: str = "error",
+        parsed: Any = None,
+    ) -> None:
+        """异常时尽量完整打印接口响应，便于判断 403/验证码/踢登录。"""
+        body = response.text if response.text is not None else ""
+        headers = {k: v for k, v in response.headers.items()}
+        # 优先关注风控 / 验证 / 会话相关头
+        interesting_keys = (
+            "content-type",
+            "content-length",
+            "x-tt-logid",
+            "x-tt-trace-id",
+            "x-ms-token",
+            "x-ware-csrf-token",
+            "x-secsdk-csrf-token",
+            "bd-ticket-guard-",
+            "location",
+            "server",
+            "via",
+            "x-blocked",
+            "x-captcha",
+            "x-verify",
+            "bdturing",
+        )
+        focus = {}
+        for k, v in headers.items():
+            lk = k.lower()
+            if any(lk == ik or lk.startswith(ik) for ik in interesting_keys):
+                focus[k] = v
+        _log("=" * 60)
+        _log(f"[{tag}] ERROR response dump")
+        _log(
+            f"[{tag}] status={response.status_code} reason={response.reason!r} "
+            f"url={response.url}"
+        )
+        _log(f"[{tag}] resp_headers_focus={json.dumps(focus, ensure_ascii=False) if focus else '(none matched)'}")
+        _log(f"[{tag}] resp_headers_all={json.dumps(headers, ensure_ascii=False)}")
+        _log(f"[{tag}] resp_body_len={len(body.encode('utf-8', errors='replace'))}")
+        if body:
+            _log(f"[{tag}] resp_body={body}")
+        else:
+            _log(f"[{tag}] resp_body=(empty)")
+        if parsed is not None:
+            _log(f"[{tag}] resp_json={json.dumps(parsed, ensure_ascii=False)}")
+        blob = (body + " " + json.dumps(headers, ensure_ascii=False)).lower()
+        hints = []
+        for kw in (
+            "captcha",
+            "verify",
+            "bdturing",
+            "滑块",
+            "验证码",
+            "二次验证",
+            "用户未登录",
+            "login",
+            "forbidden",
+        ):
+            if kw.lower() in blob or kw in body:
+                hints.append(kw)
+        if not body and response.status_code == 403:
+            hints.append("empty_403_likely_waf_or_secsdk")
+        _log(f"[{tag}] risk_hints={hints or ['(none)']}")
+        _log("=" * 60)
 
     def _creator_url(
         self,
@@ -849,8 +929,11 @@ class DouyinPublisher:
         """上传封面，返回 {uri, width, height}。"""
         return self.upload_image(creds, cover_path)
 
-    def wait_video_ready(self, video_id: str, timeout: int = 120) -> None:
-        """网页在 create 前会轮询 enable / transend，确认转码可用。"""
+    def wait_video_ready(self, video_id: str, timeout: int = 180) -> None:
+        """网页在 create 前会轮询 enable / transend，确认转码可用。
+
+        仅 status_code=0 不够：transend 里 encode=0 / codec 空时发布易被风控拦。
+        """
         deadline = time.time() + timeout
         last: dict[str, Any] = {}
         while time.time() < deadline:
@@ -877,24 +960,30 @@ class DouyinPublisher:
                     _log(f"[video] {path} error: {e}")
                     last[path] = {"error": str(e)}
 
-            ok_flags = []
-            for data in last.values():
-                if not isinstance(data, dict) or "error" in data:
-                    ok_flags.append(False)
-                    continue
-                sc = data.get("status_code")
-                if sc in (0, "0", None):
-                    ok_flags.append(True)
-                elif data.get("code") == 0:
-                    ok_flags.append(True)
-                else:
-                    ok_flags.append(
-                        any(
-                            k in data
-                            for k in ("enable", "is_transcode", "play_addr", "video_status")
-                        )
-                    )
-            if ok_flags and all(ok_flags):
+            enable = last.get("/web/api/media/video/enable/") or {}
+            transend = last.get("/web/api/media/video/transend/") or {}
+            enable_ok = (
+                isinstance(enable, dict)
+                and "error" not in enable
+                and enable.get("status_code") in (0, "0", None)
+            )
+            trans_ok = False
+            if isinstance(transend, dict) and "error" not in transend:
+                sc = transend.get("status_code")
+                encode = transend.get("encode")
+                codec = (transend.get("codec_type") or "").strip()
+                # encode=1 或已有码率/编码信息，才认为可发
+                if sc in (0, "0", None) and (
+                    encode in (1, "1", True)
+                    or bool(codec)
+                    or int(transend.get("bitrate") or 0) > 0
+                ):
+                    trans_ok = True
+                _log(
+                    f"[video] readiness enable_ok={enable_ok} trans_ok={trans_ok} "
+                    f"encode={encode!r} codec={codec!r} bitrate={transend.get('bitrate')}"
+                )
+            if enable_ok and trans_ok:
                 _log(f"[video] ready video_id={video_id}")
                 return
             time.sleep(2)
@@ -995,6 +1084,11 @@ class DouyinPublisher:
             f"body_bytes={len(body_str.encode('utf-8'))} "
             f"url={_url_brief(url)}"
         )
+        if "msToken=" not in url:
+            _log(
+                "[publish] WARN: create_v2 URL 无 msToken。"
+                "浏览器实发必带；这是空 body 403 的高危信号。"
+            )
         t0 = time.time()
         r = self._track(
             self.session.post(url, headers=headers, data=body_str.encode("utf-8"), timeout=60)
@@ -1002,14 +1096,22 @@ class DouyinPublisher:
         elapsed = (time.time() - t0) * 1000
         self._log_http("publish", "POST", url, r, elapsed, headers, body_str)
         if r.status_code >= 400:
+            self._dump_error_response(r, tag="create_v2")
             raise RuntimeError(
-                f"create_v2 HTTP {r.status_code}: {_clip(r.text, 800)} "
+                f"create_v2 HTTP {r.status_code}: {_clip(r.text, 800) or '(empty body)'} "
                 f"(csrf={'yes' if self.csrf_token else 'no'}, "
                 f"msToken={'yes' if self.ms_token.token else 'no'}, "
                 f"ticket={'yes' if self.ticket_signer else 'no'})"
             )
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            self._dump_error_response(r, tag="create_v2")
+            raise RuntimeError(
+                f"create_v2 非 JSON 响应 HTTP {r.status_code}: {_clip(r.text, 800) or '(empty)'}"
+            )
         if data.get("status_code") != 0:
+            self._dump_error_response(r, tag="create_v2", parsed=data)
             raise RuntimeError(f"create_v2 failed: {data}")
         _log(f"[publish] ok item_id={data.get('item_id')} full={_clip(data, 400)}")
         return data
@@ -1190,7 +1292,7 @@ def load_cookie(path: Path) -> str:
 
 def main() -> int:
     # 直接改这里的参数即可
-    mode = "video"  # "video" | "image"
+    mode = "image"  # "video" | "image"
     video = "response.mp4"  # 视频文件路径（mode=video）
     images = ["cover.jpg", "cover.jpg", "cover.jpg"]  # 图文图片路径列表（mode=image，最多 35 张）
     image_workers = 4  # 图文并发上传线程数，1=串行，建议 3~8

@@ -18,9 +18,15 @@
              需本机安装 Node.js；失败时返回空并跳过。
 
 2) msToken (URL query)
-   生成位置: 同 bdms 钩子一并 append
-   来源备选: 响应头 x-ms-token / 上次请求 query / mssdk
-   状态:    可复用响应头，无需完整逆向
+   生成位置: sdk-glue 将 mssdk 映射到 bdms；POST mssdk.bytedance.com
+   接口:    POST https://mssdk.bytedance.com/web/r/token?ms_appid=2906[&msToken=旧]
+             或 /web/common
+   请求体:  {magic:538969122, version:1, dataType:8, strData:<密文>,
+             tspFromClient:<ms>, ulr:0}  Content-Type: text/plain
+   出参:    响应头 x-ms-token
+   说明:    每次换票由 sign_mssdk/gen_strdata.js（Node vm + bdms）现场生成 strData，
+             经 stdout 交给 Python，不读写 mssdk_strdata.json；再 POST 换 x-ms-token。
+   状态:    ★ 每次 Node 现场产 strData + mssdk 换票 + 响应头复用
 
 3) bd-ticket-guard-* (请求头)  ★ 本模块已还原
    生成位置: ucenter ticket SDK
@@ -39,8 +45,9 @@
          ts_sign, req_content: "ticket,path,timestamp",
          req_sign, timestamp
      }))
-     bd-ticket-guard-ree-public-key = Base64(压缩公钥相关，来自 cookie/cert)
-     bd-ticket-guard-version / web-version / web-sign-type = 固定 2/2/1
+     bd-ticket-guard-ree-public-key = Base64(未压缩公钥 0x04||x||y，来自 client_cert)
+     bd-ticket-guard-version / web-version / iteration-version = 2/2/1
+     bd-ticket-guard-web-sign-type = 0(ecdsa) / 1(hmac)  ← 与 algoType 一致，勿写死 1
 
 4) x-secsdk-csrf-token
    不需逆向: 对 API 路径 HEAD + X-Secsdk-Csrf-Request: 1
@@ -54,7 +61,7 @@
 二、本文件实现
 ================================================================================
 - TicketGuardSigner: 完整纯 Python 实现 (cryptography)
-- MsTokenCache: 从响应头复用 msToken
+- MsTokenCache: Node bdms 补环境产 strData + mssdk 刷新 + x-ms-token 复用
 - a_bogus: Node 进程池调用 sign_a_bogus/sign.js（bdms VM，可并发）
 """
 
@@ -176,12 +183,16 @@ class TicketGuardSigner:
         # cookie bd_ticket_guard_client_data 里也可能是完整 b64 公钥
         return cert
 
-    def headers_for(self, url: str) -> dict[str, str]:
+    def headers_for(self, url: str, *, algo_type: str = "ecdsa") -> dict[str, str]:
+        # ucenter: web-sign-type = +("hmac" === algoType) → ecdsa 必须为 0
+        # 写死 1 时服务端按 HMAC 验签 → Bd-Ticket-Guard-Result 1205 / Key-Sign 2
+        sign_type = "1" if algo_type == "hmac" else "0"
         ree = self.ree_public_key()
         h = {
             "bd-ticket-guard-version": "2",
+            "bd-ticket-guard-iteration-version": "1",
             "bd-ticket-guard-web-version": "2",
-            "bd-ticket-guard-web-sign-type": "1",
+            "bd-ticket-guard-web-sign-type": sign_type,
             "bd-ticket-guard-client-data": self.build_client_data(url),
         }
         if ree:
@@ -193,14 +204,204 @@ class TicketGuardSigner:
 # msToken
 # ---------------------------------------------------------------------------
 
+# creator 站 mssdk appid（浏览器抓包恒为 2906）
+MSSDK_APPID = "2906"
+MSSDK_TOKEN_URL = "https://mssdk.bytedance.com/web/r/token"
+MSSDK_COMMON_URL = "https://mssdk.bytedance.com/web/common"
+
+
+def _normalize_mssdk_payload(data: object) -> Optional[dict]:
+    if not isinstance(data, dict) or not data.get("strData"):
+        return None
+    return {
+        "magic": int(data.get("magic") or 538969122),
+        "version": int(data.get("version") or 1),
+        "dataType": int(data.get("dataType") or 8),
+        "strData": str(data["strData"]),
+        "ulr": int(data.get("ulr") or 0),
+    }
+
+
+def harvest_mssdk_strdata(
+    *,
+    cookie_file: Optional[Path] = None,
+    timeout_sec: float = 30.0,
+) -> Optional[dict]:
+    """
+    调用 sign_mssdk/gen_strdata.js（Node vm + bdms）生成 strData，仅走 stdout，不读本地文件。
+    成功返回 {magic, version, dataType, strData, ulr}。
+    """
+    if os.environ.get("DOUYIN_MSSDK_HARVEST", "1").strip() in {"0", "false", "no"}:
+        return None
+    node = _resolve_node()
+    if not node:
+        return None
+    script = _ROOT / "sign_mssdk" / "gen_strdata.js"
+    if not script.is_file():
+        return None
+    cmd = [node, str(script), "--json"]
+    _ = cookie_file
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            check=False,
+        )
+    except Exception:
+        return None
+    line = (proc.stdout or "").strip().splitlines()
+    last = line[-1] if line else ""
+    try:
+        data = json.loads(last) if last else {}
+    except Exception:
+        return None
+    if proc.returncode != 0 or not data.get("ok"):
+        return None
+    return _normalize_mssdk_payload(data.get("payload") or {})
+
+
+def fetch_ms_token_from_mssdk(
+    *,
+    seed_token: str = "",
+    user_agent: str = "",
+    cookie: str = "",
+    strdata_path: Optional[Path] = None,
+    timeout: float = 20.0,
+    auto_harvest: bool = True,
+) -> Optional[str]:
+    """
+    POST mssdk /web/r/token（失败再试 /web/common），从 x-ms-token 取新 token。
+    每次由 Node 现场生成 strData（不使用 mssdk_strdata.json）。
+    """
+    _ = strdata_path  # 兼容旧参数，已忽略
+    if not auto_harvest:
+        return None
+
+    def _post_once(payload_base: dict) -> Optional[str]:
+        payload = dict(payload_base)
+        payload["tspFromClient"] = int(time.time() * 1000)
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        headers = {
+            "User-Agent": user_agent
+            or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Origin": "https://creator.douyin.com",
+            "Referer": "https://creator.douyin.com/",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        params: dict = {"ms_appid": MSSDK_APPID}
+        if seed_token:
+            params["msToken"] = seed_token
+        import requests as _requests
+
+        for url in (MSSDK_TOKEN_URL, MSSDK_COMMON_URL):
+            try:
+                resp = _requests.post(
+                    url,
+                    params=params,
+                    data=body.encode("utf-8"),
+                    headers=headers,
+                    timeout=timeout,
+                )
+            except Exception:
+                continue
+            tok = resp.headers.get("x-ms-token") or resp.headers.get("X-Ms-Token")
+            if not tok:
+                try:
+                    tok = resp.cookies.get("msToken") or ""
+                except Exception:
+                    tok = ""
+            if tok and len(tok) >= 64:
+                return tok.strip()
+        return None
+
+    for _attempt in range(2):
+        base = harvest_mssdk_strdata()
+        if not base:
+            continue
+        tok = _post_once(base)
+        if tok:
+            return tok
+    return None
+
+
 class MsTokenCache:
-    def __init__(self, initial: str = ""):
-        self.token = initial
+    def __init__(self, initial: str = "", persist_path: Optional[Path] = None):
+        self.token = (initial or "").strip()
+        self.persist_path = persist_path
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        env_key: str = "DOUYIN_MS_TOKEN",
+        path: Optional[Path] = None,
+        persist: bool = False,
+    ) -> "MsTokenCache":
+        """优先环境变量；默认不落盘。persist=True 时才读写 path（默认 ms_token.txt）。"""
+        initial = (os.environ.get(env_key) or "").strip()
+        p = path or (_ROOT / "ms_token.txt")
+        if persist and not initial and p.is_file():
+            try:
+                initial = p.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            except Exception:
+                initial = ""
+        return cls(initial=initial, persist_path=p if persist else None)
+
+    def refresh_from_mssdk(
+        self,
+        *,
+        user_agent: str = "",
+        cookie: str = "",
+        force: bool = False,
+        strdata_path: Optional[Path] = None,
+        auto_harvest: bool = True,
+    ) -> bool:
+        """
+        用 mssdk 换新 msToken；每次现场生成 strData（不读本地 json）。
+        返回是否拿到了可用 token。
+        """
+        new = fetch_ms_token_from_mssdk(
+            seed_token=self.token,
+            user_agent=user_agent,
+            cookie=cookie,
+            strdata_path=strdata_path,
+            auto_harvest=auto_harvest,
+        )
+        if new:
+            self.set_token(new)
+            return True
+        return bool(self.token) if not force else False
 
     def update_from_response(self, response) -> None:
         tok = response.headers.get("x-ms-token") or response.headers.get("X-Ms-Token")
         if tok:
             self.token = tok
+            self._persist()
+
+    def set_token(self, token: str) -> None:
+        token = (token or "").strip()
+        if token and token != self.token:
+            self.token = token
+            self._persist()
+
+    def _persist(self) -> None:
+        if not self.persist_path or not self.token:
+            return
+        try:
+            self.persist_path.write_text(self.token, encoding="utf-8")
+        except Exception:
+            pass
 
     def apply_to_url(self, url: str) -> str:
         if not self.token:
@@ -224,7 +425,7 @@ def _resolve_node() -> Optional[str]:
 
 
 def _a_bogus_pool_size() -> int:
-    raw = os.environ.get("DOUYIN_A_BOGUS_WORKERS", "2").strip()
+    raw = os.environ.get("DOUYIN_A_BOGUS_WORKERS", "4").strip()
     try:
         n = int(raw)
     except ValueError:
