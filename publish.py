@@ -2,35 +2,50 @@
 """
 抖音创作者中心 - 视频 / 图文上传并发布（纯 HTTP，无浏览器自动化）
 
-基于对 creator.douyin.com 实际抓包还原的流程：
+基于 creator.douyin.com 抓包还原。
 
-视频:
-1) GET  /web/api/media/upload/auth/v5/          获取 VOD/ImageX 临时 STS
-2) GET  vod.bytedanceapi.com?Action=ApplyUploadInner
-3) POST tos-*/upload/v1/{StoreUri}             分片上传 (init / transfer / finish)
-4) POST vod.bytedanceapi.com?Action=CommitUploadInner  -> video_id (Vid)
-5) GET  imagex.bytedanceapi.com?Action=ApplyImageUpload
-6) POST tos-*/upload/v1/{cover StoreUri}       上传封面 JPEG
-7) POST imagex.bytedanceapi.com?Action=CommitImageUpload -> poster uri
-8) POST /web/api/media/aweme/create_v2/        media_type=4
+视频发布:
+  0) GET  /web/api/media/user/info/                 解析 user_id（登录态）
+  1) GET  /web/api/media/upload/auth/v5/            临时 STS（VOD / ImageX）
+  2) GET  vod.bytedanceapi.com?Action=ApplyUploadInner
+  3) POST {UploadHost}/upload/v1/{StoreUri}         分片 init / transfer / finish
+  4) POST vod...?Action=CommitUploadInner           -> video_id (Vid)
+  5) GET  /web/api/media/upload/auth/v5/            再取 STS（封面走 ImageX）
+  6) GET  imagex...?Action=ApplyImageUpload
+  7) POST tos upload/v1/{cover} + CommitImageUpload -> poster uri
+  8) GET  /web/api/media/video/enable|transend/     轮询转码就绪
+  9) POST /web/api/media/aweme/create_v2/           media_type=4
 
-图文 (2026-07-22 抓包):
-1) GET  /web/api/media/upload/auth/v5/
-2) ApplyImageUpload + TOS 上传 + CommitImageUpload  （每张图）
-3) POST /web/api/media/aweme/create_v2/        media_type=2, images=[{uri,width,height}]
+图文发布:
+  0) GET  /web/api/media/user/info/                 解析 user_id
+  1) GET  /web/api/media/upload/auth/v5/            STS
+  2) 每张图: ApplyImageUpload → TOS 上传 → CommitImageUpload
+     （可 ThreadPool 并发，workers=1~8）
+  3) 可选再传自定义封面（同样 ImageX 流程）
+  4) POST /web/api/media/aweme/create_v2/           media_type=2, images=[...]
+
+创作者请求风控挂载（_creator_url / create_v2）:
+  - URL query: msToken、a_bogus（及浏览器指纹参数）
+  - Header: x-secsdk-csrf-token、bd-ticket-guard-*
 
 用法:
-  1. 浏览器登录 https://creator.douyin.com 后，把 Cookie 写入 cookies.txt
-  2. pip install -r requirements.txt
-  3. 在 main() 里改好 mode / 路径 / title 等参数后执行: python publish.py
+  1. 浏览器登录创作者中心，导出 Cookie → cookies.txt
+     以及 localStorage security-sdk → security_sdk.json（ticket-guard）
+  2. pip install -r requirements.txt ；需本机 Node.js
+  3. 改 main() 里 mode / 路径 / 文案后: python publish.py
+     仅测登录: python publish.py --check-login  （或 mode="check"）
 
 说明:
-  - 不依赖 Playwright / Selenium 等自动化工具
-  - 风控参数见 sign_params.py：
-      * bd-ticket-guard 已纯 Python 还原（需 security_sdk.json）
-      * msToken 从响应头 x-ms-token 复用
-      * a_bogus 通过 Node 跑 _reverse/bdms.min.js 生成（需安装 Node.js）
-  - Cookie / security_sdk.json 会过期，失败时从浏览器重新导出
+  - 不依赖 Playwright / Selenium
+  - DouyinPublisher(cookie, security_sdk=dict|SecurityMaterial)，不收文件路径；
+    main() 自行读 json 再传入
+  - 风控实现见 sign_params.py:
+      * bd-ticket-guard  纯 Python ECDSA（需 security_sdk 数据）
+      * msToken          Node gen_strdata --serve → POST mssdk 换票
+      * a_bogus          Node 跑 _reverse/bdms.min.js（进程池）
+      * x-secsdk-csrf    HEAD .../user/info/ 换取
+  - check_login(cookie) 只传 Cookie 探测是否登录
+  - Cookie / security_sdk 会过期，失败时从浏览器重新导出
 """
 
 from __future__ import annotations
