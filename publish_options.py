@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -97,10 +100,9 @@ class PublishOptions:
 
         if skipped_tags:
             # 避免污染 text；需要话题时请传 {hashtag_name, hashtag_id}
-            print(
-                f"[options] skip hashtags without id: {skipped_tags} "
-                "(裸 #话题 会触发简介非法)",
-                flush=True,
+            logger.warning(
+                "[options] skip hashtags without id: %s (裸 #话题 会触发简介非法)",
+                skipped_tags,
             )
 
         mentions_payload: list[Any] = []

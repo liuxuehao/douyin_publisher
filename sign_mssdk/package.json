@@ -6,6 +6,7 @@
   "main": "gen_strdata.js",
   "scripts": {
     "gen": "node gen_strdata.js",
-    "gen:json": "node gen_strdata.js --json"
+    "gen:json": "node gen_strdata.js --json",
+    "serve": "node gen_strdata.js --serve"
   }
 }

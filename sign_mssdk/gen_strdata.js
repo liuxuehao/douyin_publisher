@@ -7,6 +7,7 @@
  * CLI:
  *   node gen_strdata.js --json
  *   node gen_strdata.js --out ../mssdk_strdata.json --json   # 可选落盘
+ *   node gen_strdata.js --serve   # stdin 行协议 JSON RPC（进程池复用）
  */
 "use strict";
 
@@ -27,6 +28,7 @@ function parseArgs(argv) {
     pageId: 0,
     json: false,
     waitMs: 1500,
+    serve: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -38,9 +40,14 @@ function parseArgs(argv) {
     else if (a === "--page-id") out.pageId = Number(next());
     else if (a === "--wait") out.waitMs = Number(next()) || out.waitMs;
     else if (a === "--json") out.json = true;
+    else if (a === "--serve") out.serve = true;
     else if (a === "--help" || a === "-h") out.help = true;
   }
   return out;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function findScript(name) {
@@ -119,7 +126,7 @@ function runInSandbox(code, context, filename) {
   vm.runInContext(code, context, { filename, timeout: 20000 });
 }
 
-function harvest(opts = {}) {
+async function harvest(opts = {}) {
   const sandbox = createSandbox({
     userAgent: opts.userAgent || DEFAULT_UA,
     href: opts.href || "https://creator.douyin.com/creator-micro/content/upload",
@@ -209,36 +216,100 @@ function harvest(opts = {}) {
     context,
   );
 
-  return new Promise((resolve, reject) => {
-    const waitMs = opts.waitMs != null ? opts.waitMs : 1500;
-    setTimeout(() => {
-      // 优先取较长的 strData（更接近完整指纹）
-      const bodies = bag.bodies.slice().sort((a, b) => b.strData.length - a.strData.length);
-      const best = bodies[0];
-      if (!best) {
-        reject(new Error("未截获 mssdk strData（检查 _reverse/bdms.min.js / sdk-glue.js）"));
-        return;
+  const waitMs = opts.waitMs != null ? opts.waitMs : 1500;
+  const deadline = Date.now() + waitMs;
+  // 有结果就提前返回，避免 serve 模式每次死等满 waitMs
+  while (!bag.bodies.length && Date.now() < deadline) {
+    await sleep(40);
+  }
+  if (!bag.bodies.length) {
+    await sleep(Math.max(0, deadline - Date.now()));
+  }
+
+  const bodies = bag.bodies.slice().sort((a, b) => b.strData.length - a.strData.length);
+  const best = bodies[0];
+  if (!best) {
+    throw new Error("未截获 mssdk strData（检查 _reverse/bdms.min.js / sdk-glue.js）");
+  }
+  if (opts.out) {
+    fs.writeFileSync(opts.out, JSON.stringify(best), "utf8");
+  }
+  return {
+    ok: true,
+    out: opts.out || "",
+    payload: best,
+    strDataLen: best.strData.length,
+    samples: bodies.length,
+    url: (bag.lastUrl || "").slice(0, 120),
+  };
+}
+
+function startServe(defaults) {
+  const readline = require("readline");
+  process.on("unhandledRejection", () => {});
+  // 预读脚本，warm V8；真正 harvest 仍每次新建 sandbox（隔离更稳）
+  try {
+    const bdmsPath = findScript("bdms.min.js") || findScript("bdms.js");
+    if (!bdmsPath) throw new Error("bdms.min.js not found");
+    fs.readFileSync(bdmsPath, "utf8");
+    const gluePath = findScript("sdk-glue.js");
+    if (gluePath) fs.readFileSync(gluePath, "utf8");
+    process.stderr.write("[mssdk] serve ready\n");
+  } catch (e) {
+    process.stderr.write("[mssdk] serve init failed: " + e + "\n");
+    process.exit(1);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  // 单进程串行处理，避免 sandbox/XHR 交错；并发靠 Python 侧进程池
+  let chain = Promise.resolve();
+
+  rl.on("line", (line) => {
+    const raw = String(line || "").trim();
+    if (!raw) return;
+    chain = chain.then(async () => {
+      try {
+        const req = JSON.parse(raw);
+        if (req && req.cmd === "ping") {
+          process.stdout.write(JSON.stringify({ ok: true, pong: true }) + "\n");
+          return;
+        }
+        if (req && req.cmd === "harvest") {
+          const result = await harvest({
+            userAgent: req.userAgent || req.ua || defaults.userAgent,
+            href: req.href || defaults.href,
+            aid: req.aid != null ? Number(req.aid) : defaults.aid,
+            pageId: req.pageId != null ? Number(req.pageId) : defaults.pageId,
+            waitMs: req.waitMs != null ? Number(req.waitMs) : defaults.waitMs,
+            paths: req.paths || undefined,
+            out: "",
+          });
+          process.stdout.write(JSON.stringify(result) + "\n");
+          return;
+        }
+        process.stdout.write(JSON.stringify({ ok: false, error: "unknown cmd" }) + "\n");
+      } catch (e) {
+        process.stdout.write(
+          JSON.stringify({ ok: false, error: String(e && e.stack ? e.stack : e) }) + "\n",
+        );
       }
-      if (opts.out) {
-        fs.writeFileSync(opts.out, JSON.stringify(best), "utf8");
-      }
-      resolve({
-        ok: true,
-        out: opts.out || "",
-        payload: best,
-        strDataLen: best.strData.length,
-        samples: bodies.length,
-        url: (bag.lastUrl || "").slice(0, 120),
-      });
-    }, waitMs);
+    });
   });
 }
 
 async function main() {
   const args = parseArgs(process.argv);
   if (args.help) {
-    console.log("Usage: node gen_strdata.js [--json] [--out path] [--wait ms]\n  默认不写文件，--json 时 stdout 含 payload");
+    console.log(
+      "Usage:\n" +
+        "  node gen_strdata.js [--json] [--out path] [--wait ms]\n" +
+        "  node gen_strdata.js --serve   # line-delimited JSON RPC on stdin",
+    );
     process.exit(0);
+  }
+  if (args.serve) {
+    startServe(args);
+    return;
   }
   try {
     const result = await harvest(args);

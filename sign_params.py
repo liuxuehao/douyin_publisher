@@ -61,7 +61,7 @@
 二、本文件实现
 ================================================================================
 - TicketGuardSigner: 完整纯 Python 实现 (cryptography)
-- MsTokenCache: Node bdms 补环境产 strData + mssdk 刷新 + x-ms-token 复用
+- MsTokenCache: Node --serve 进程池产 strData + mssdk 换票（DOUYIN_MSSDK_WORKERS）
 - a_bogus: Node 进程池调用 sign_a_bogus/sign.js（bdms VM，可并发）
 """
 
@@ -69,10 +69,12 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import shutil
 import subprocess
 import time
+import atexit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -82,6 +84,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 
+
+logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent
 _A_BOGUS_SCRIPT = _ROOT / "sign_a_bogus" / "sign.js"
@@ -222,25 +226,279 @@ def _normalize_mssdk_payload(data: object) -> Optional[dict]:
     }
 
 
+_MSSDK_SCRIPT = _ROOT / "sign_mssdk" / "gen_strdata.js"
+
+
+def _mssdk_pool_size() -> int:
+    raw = os.environ.get("DOUYIN_MSSDK_WORKERS", "2").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 2
+    return max(1, min(n, 16))
+
+
+class _MsSdkProc:
+    """单个 Node gen_strdata.js --serve 进程（同一时刻只处理一个 harvest）。"""
+
+    def __init__(self) -> None:
+        self._proc: Optional[subprocess.Popen] = None
+
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def close(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.terminate()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self._proc = None
+
+    def start(self) -> None:
+        import threading
+
+        node = _resolve_node()
+        if not node or not _MSSDK_SCRIPT.is_file():
+            raise RuntimeError("node or gen_strdata.js missing")
+        self.close()
+        self._proc = subprocess.Popen(
+            [node, str(_MSSDK_SCRIPT), "--serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(_ROOT),
+            bufsize=1,
+        )
+        ready = threading.Event()
+        boot_err: list[str] = []
+
+        def _watch_stderr() -> None:
+            try:
+                assert self._proc and self._proc.stderr
+                while True:
+                    line = self._proc.stderr.readline()
+                    if not line:
+                        break
+                    if "serve ready" in line:
+                        ready.set()
+                        break
+                    if "serve init failed" in line:
+                        boot_err.append(line.strip())
+                        break
+            except Exception as e:  # noqa: BLE001
+                boot_err.append(str(e))
+
+        t = threading.Thread(target=_watch_stderr, daemon=True)
+        t.start()
+        if not ready.wait(20):
+            self.close()
+            extra = boot_err[0] if boot_err else "timeout"
+            raise RuntimeError(f"mssdk worker start failed: {extra}")
+        self._write({"cmd": "ping"})
+        line = self._readline(timeout=5).strip()
+        data = json.loads(line) if line else {}
+        if not (data.get("pong") or data.get("ok")):
+            self.close()
+            raise RuntimeError(f"mssdk worker ping failed: {line[:200]}")
+
+    def _write(self, obj: dict) -> None:
+        assert self._proc and self._proc.stdin
+        self._proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+    def _readline(self, timeout: float = 30.0) -> str:
+        import threading
+
+        assert self._proc and self._proc.stdout
+        result: list[str] = []
+        err: list[BaseException] = []
+
+        def _reader() -> None:
+            try:
+                assert self._proc and self._proc.stdout
+                result.append(self._proc.stdout.readline())
+            except BaseException as e:  # noqa: BLE001
+                err.append(e)
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            self.close()
+            raise TimeoutError("mssdk worker read timeout")
+        if err:
+            raise err[0]
+        return result[0] if result else ""
+
+    def harvest(self, *, wait_ms: int = 1500, timeout: float = 30.0) -> Optional[dict]:
+        if not self.alive:
+            self.start()
+        self._write({"cmd": "harvest", "waitMs": wait_ms})
+        line = self._readline(timeout=timeout).strip()
+        if not line:
+            return None
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not data.get("ok"):
+            return None
+        return _normalize_mssdk_payload(data.get("payload") or {})
+
+
+class _MsSdkWorker:
+    """Node gen_strdata --serve 进程池，供并发换票。
+
+    环境变量 DOUYIN_MSSDK_WORKERS 控制池大小（默认 2，范围 1~16）。
+    """
+
+    def __init__(self, size: Optional[int] = None) -> None:
+        import queue
+        import threading
+
+        self._size = size if size is not None else _mssdk_pool_size()
+        self._queue: "queue.Queue[Optional[_MsSdkProc]]" = queue.Queue()
+        self._all: list[_MsSdkProc] = []
+        self._init_lock = threading.Lock()
+        self._started = False
+
+    def close(self) -> None:
+        with self._init_lock:
+            while True:
+                try:
+                    proc = self._queue.get_nowait()
+                except Exception:
+                    break
+                if proc is not None:
+                    proc.close()
+            for proc in self._all:
+                proc.close()
+            self._all.clear()
+            self._started = False
+
+    def _ensure_pool(self) -> None:
+        if self._started:
+            return
+        with self._init_lock:
+            if self._started:
+                return
+            procs: list[_MsSdkProc] = []
+            errors: list[str] = []
+            for _ in range(self._size):
+                proc = _MsSdkProc()
+                try:
+                    proc.start()
+                    procs.append(proc)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(str(e))
+                    proc.close()
+            if not procs:
+                raise RuntimeError(
+                    "mssdk pool empty: " + (errors[0] if errors else "start failed")
+                )
+            self._all = procs
+            for proc in procs:
+                self._queue.put(proc)
+            self._started = True
+            logger.info("mssdk strData pool ready workers=%s", len(procs))
+
+    def harvest(self, *, wait_ms: int = 1500, timeout: float = 30.0) -> Optional[dict]:
+        self._ensure_pool()
+        wait = max(timeout + 5.0, 35.0)
+        proc: Optional[_MsSdkProc] = None
+        try:
+            proc = self._queue.get(timeout=wait)
+        except Exception:
+            return None
+
+        def _spawn() -> _MsSdkProc:
+            fresh = _MsSdkProc()
+            fresh.start()
+            with self._init_lock:
+                self._all.append(fresh)
+            return fresh
+
+        try:
+            if proc is None or not proc.alive:
+                if proc is not None:
+                    with self._init_lock:
+                        if proc in self._all:
+                            self._all.remove(proc)
+                    proc.close()
+                proc = _spawn()
+            try:
+                return proc.harvest(wait_ms=wait_ms, timeout=timeout)
+            except Exception:
+                with self._init_lock:
+                    if proc in self._all:
+                        self._all.remove(proc)
+                proc.close()
+                proc = _spawn()
+                return proc.harvest(wait_ms=wait_ms, timeout=timeout)
+        except Exception:
+            if proc is not None:
+                try:
+                    with self._init_lock:
+                        if proc in self._all:
+                            self._all.remove(proc)
+                    proc.close()
+                except Exception:
+                    pass
+                proc = None
+            return None
+        finally:
+            if proc is not None:
+                self._queue.put(proc)
+
+
+_MSSDK_WORKER = _MsSdkWorker()
+
+
 def harvest_mssdk_strdata(
     *,
     cookie_file: Optional[Path] = None,
     timeout_sec: float = 30.0,
 ) -> Optional[dict]:
     """
-    调用 sign_mssdk/gen_strdata.js（Node vm + bdms）生成 strData，仅走 stdout，不读本地文件。
-    成功返回 {magic, version, dataType, strData, ulr}。
+    生成 mssdk strData。优先走 Node --serve 进程池（可并发）；
+    池不可用时回退到一次性 subprocess.run。
     """
     if os.environ.get("DOUYIN_MSSDK_HARVEST", "1").strip() in {"0", "false", "no"}:
         return None
+    _ = cookie_file
+    # 优先进程池（接口/多线程场景）
+    if os.environ.get("DOUYIN_MSSDK_POOL", "1").strip() not in {"0", "false", "no"}:
+        try:
+            got = _MSSDK_WORKER.harvest(timeout=timeout_sec)
+            if got:
+                return got
+        except Exception as e:
+            logger.debug("mssdk pool harvest failed, fallback oneshot: %s", e)
+    # 回退：一次性进程
+    logger.debug("mssdk harvest via oneshot subprocess")
     node = _resolve_node()
     if not node:
         return None
-    script = _ROOT / "sign_mssdk" / "gen_strdata.js"
-    if not script.is_file():
+    if not _MSSDK_SCRIPT.is_file():
         return None
-    cmd = [node, str(script), "--json"]
-    _ = cookie_file
+    cmd = [node, str(_MSSDK_SCRIPT), "--json"]
     try:
         proc = subprocess.run(
             cmd,
@@ -263,6 +521,11 @@ def harvest_mssdk_strdata(
     if proc.returncode != 0 or not data.get("ok"):
         return None
     return _normalize_mssdk_payload(data.get("payload") or {})
+
+
+def close_mssdk_pool() -> None:
+    """关闭 mssdk strData 进程池（进程退出或接口停机时调用）。"""
+    _MSSDK_WORKER.close()
 
 
 def fetch_ms_token_from_mssdk(
@@ -629,6 +892,7 @@ class _ABogusWorker:
             for proc in procs:
                 self._queue.put(proc)
             self._started = True
+            logger.info("a_bogus pool ready workers=%s", len(procs))
 
     def sign(
         self,
@@ -710,6 +974,20 @@ class _ABogusWorker:
 _WORKER = _ABogusWorker()
 
 
+def close_a_bogus_pool() -> None:
+    """关闭 a_bogus 进程池。"""
+    _WORKER.close()
+
+
+def close_risk_pools() -> None:
+    """关闭 mssdk / a_bogus 全部 Node 进程池（接口停机时调用）。"""
+    close_mssdk_pool()
+    close_a_bogus_pool()
+
+
+atexit.register(close_risk_pools)
+
+
 def sign_a_bogus(
     url: str,
     body: str = "",
@@ -784,19 +1062,26 @@ def attach_risk_params(
 # ---------------------------------------------------------------------------
 
 def _demo_sign(sdk_path: Path, url: str) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
     mat = SecurityMaterial.from_json_file(sdk_path)
     signer = TicketGuardSigner(mat)
     headers = signer.headers_for(url)
-    print("pathname:", TicketGuardSigner._pathname(url))
-    print("headers:")
+    logger.info("pathname: %s", TicketGuardSigner._pathname(url))
     for k, v in headers.items():
         preview = v if len(v) < 80 else v[:60] + "..."
-        print(f"  {k}: {preview}")
-    # decode client-data
+        logger.info("  %s: %s", k, preview)
     raw = base64.b64decode(headers["bd-ticket-guard-client-data"])
-    print("client-data json:", raw.decode("utf-8"))
+    logger.info("client-data json: %s", raw.decode("utf-8"))
     bogus = sign_a_bogus(url, method="GET")
-    print("a_bogus:", (bogus[:80] + "...") if len(bogus) > 80 else (bogus or "(empty)"))
+    logger.info(
+        "a_bogus: %s",
+        (bogus[:80] + "...") if len(bogus) > 80 else (bogus or "(empty)"),
+    )
 
 
 if __name__ == "__main__":

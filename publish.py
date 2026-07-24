@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
 import time
@@ -59,6 +60,8 @@ from sign_params import (
 )
 from publish_options import PublishOptions
 
+logger = logging.getLogger(__name__)
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
@@ -73,12 +76,42 @@ AID = "1128"
 IMAGEX_SERVICE_ID = "jm8ajry58r"
 PART_SIZE = 5 * 1024 * 1024  # 5MB，与网页一致
 
-# 详细日志默认开启；设环境变量 DOUYIN_LOG_VERBOSE=0 可关掉冗长字段
+# 详细字段默认开 DEBUG；DOUYIN_LOG_VERBOSE=0 → INFO；也可用 DOUYIN_LOG_LEVEL 覆盖
 LOG_VERBOSE = os.environ.get("DOUYIN_LOG_VERBOSE", "1").strip() not in ("0", "false", "False")
 
 
+def setup_logging() -> None:
+    """配置根日志。DOUYIN_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR 优先于 VERBOSE。"""
+    level_name = os.environ.get("DOUYIN_LOG_LEVEL", "").strip().upper()
+    if level_name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        level = getattr(logging, level_name)
+    else:
+        level = logging.DEBUG if LOG_VERBOSE else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    # 避免 DEBUG 时 urllib3 刷屏
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+
+
 def _log(msg: str) -> None:
-    print(msg, flush=True)
+    logger.info("%s", msg)
+
+
+def _log_debug(msg: str) -> None:
+    logger.debug("%s", msg)
+
+
+def _log_warn(msg: str) -> None:
+    logger.warning("%s", msg)
+
+
+def _log_error(msg: str) -> None:
+    logger.error("%s", msg)
 
 
 def _clip(text: Any, n: int = 300) -> str:
@@ -122,6 +155,80 @@ def _url_brief(url: str) -> str:
         return f"{p.scheme}://{p.netloc}{p.path}?[{qhint}]"
     except Exception:
         return _clip(url, 160)
+
+
+# ---------------------------------------------------------------------------
+# 登录态检测（只传 Cookie）
+# ---------------------------------------------------------------------------
+
+def check_login(cookie: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    """输入 Cookie 字符串，请求 creator user/info 判断是否已登录。
+
+    返回:
+      ok        True=已登录
+      user_id   用户 uid（未登录为空）
+      nickname  昵称（可能为空）
+      message   简要说明
+    """
+    cookie = (cookie or "").strip()
+    if not cookie:
+        out = {"ok": False, "user_id": "", "nickname": "", "message": "Cookie 为空"}
+        logger.warning("[login] %s", out["message"])
+        return out
+
+    sess = requests.Session()
+    sess.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"{CREATOR}/",
+            "Origin": CREATOR,
+            "Cookie": cookie,
+        }
+    )
+    try:
+        r = sess.get(
+            f"{CREATOR}/web/api/media/user/info/",
+            params={"aid": AID},
+            timeout=timeout,
+        )
+        data = r.json()
+    except Exception as e:
+        out = {
+            "ok": False,
+            "user_id": "",
+            "nickname": "",
+            "message": f"请求失败: {e}",
+        }
+        logger.warning("[login] %s", out["message"])
+        return out
+
+    api_code = data.get("status_code")
+    api_msg = str(data.get("status_msg") or "")
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    uid = str(user.get("uid") or user.get("user_id") or "") or ""
+    nick = str(user.get("nickname") or "") or ""
+
+    ok = api_code in (0, "0") and bool(uid) and "未登录" not in api_msg
+    if api_code in (8, "8") or "未登录" in api_msg:
+        ok = False
+
+    out = {
+        "ok": ok,
+        "user_id": uid if ok else "",
+        "nickname": nick if ok else "",
+        "message": (
+            f"已登录 user_id={uid}" + (f" nickname={nick}" if nick else "")
+            if ok
+            else (api_msg or f"未登录 status_code={api_code}")
+        ),
+    }
+    logger.info("[login] %s", out["message"])
+    return out
+
+
+# 兼容旧名
+check_login_state = check_login
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +340,7 @@ class DouyinPublisher:
         self,
         cookie: str,
         user_id: str = "",
-        security_sdk: Optional[Path] = None,
-        security_material: Optional[SecurityMaterial] = None,
+        security_sdk: Optional[SecurityMaterial | dict[str, Any]] = None,
     ):
         cookie = cookie.strip()
         self.session = requests.Session()
@@ -258,14 +364,16 @@ class DouyinPublisher:
                 "(mssdk 刷新失败，沿用本地/环境变量)"
             )
         else:
-            _log(
+            _log_warn(
                 "[init] msToken empty — create_v2 可能 403；"
                 "请确认 Node + _reverse/bdms.min.js，或设置 DOUYIN_MS_TOKEN"
             )
         self.ticket_signer: Optional[TicketGuardSigner] = None
-        material = security_material
-        if material is None and security_sdk and security_sdk.is_file():
-            material = SecurityMaterial.from_json_file(security_sdk)
+        material: Optional[SecurityMaterial] = None
+        if isinstance(security_sdk, SecurityMaterial):
+            material = security_sdk
+        elif isinstance(security_sdk, dict):
+            material = SecurityMaterial.from_dict(security_sdk)
         _log(f"[init] cookie {_cookie_digest(cookie)}")
         _log(f"[init] user_id_arg={user_id or '(empty)'}")
         if material is not None:
@@ -277,14 +385,14 @@ class DouyinPublisher:
                 f"cert={'yes' if material.client_cert else 'no'}"
             )
         else:
-            _log("[risk] ticket-guard missing (create_v2 可能 403)")
+            _log_warn("[risk] ticket-guard missing (create_v2 可能 403)")
         self._refresh_csrf()
 
     def _track(self, response: requests.Response) -> requests.Response:
         before = self.ms_token.token
         self.ms_token.update_from_response(response)
-        if LOG_VERBOSE and self.ms_token.token and self.ms_token.token != before:
-            _log(f"[msToken] updated len={len(self.ms_token.token)}")
+        if self.ms_token.token and self.ms_token.token != before:
+            _log_debug(f"[msToken] updated len={len(self.ms_token.token)}")
         return response
 
     def _log_http(
@@ -302,7 +410,7 @@ class DouyinPublisher:
             f"HTTP {response.status_code} ({elapsed_ms:.0f}ms) "
             f"body={_clip(response.text, 240)}"
         )
-        if LOG_VERBOSE and req_headers:
+        if req_headers and logger.isEnabledFor(logging.DEBUG):
             interesting = {
                 k: (_clip(v, 64) if "data" in k.lower() or "token" in k.lower() or "key" in k.lower() else v)
                 for k, v in req_headers.items()
@@ -320,9 +428,9 @@ class DouyinPublisher:
                 }
             }
             if interesting:
-                _log(f"[{tag}] req_headers={interesting}")
-        if LOG_VERBOSE and body_preview:
-            _log(f"[{tag}] req_body={_clip(body_preview, 400)}")
+                _log_debug(f"[{tag}] req_headers={interesting}")
+        if body_preview and logger.isEnabledFor(logging.DEBUG):
+            _log_debug(f"[{tag}] req_body={_clip(body_preview, 400)}")
 
     def _dump_error_response(
         self,
@@ -356,21 +464,24 @@ class DouyinPublisher:
             lk = k.lower()
             if any(lk == ik or lk.startswith(ik) for ik in interesting_keys):
                 focus[k] = v
-        _log("=" * 60)
-        _log(f"[{tag}] ERROR response dump")
-        _log(
+        _log_error("=" * 60)
+        _log_error(f"[{tag}] ERROR response dump")
+        _log_error(
             f"[{tag}] status={response.status_code} reason={response.reason!r} "
             f"url={response.url}"
         )
-        _log(f"[{tag}] resp_headers_focus={json.dumps(focus, ensure_ascii=False) if focus else '(none matched)'}")
-        _log(f"[{tag}] resp_headers_all={json.dumps(headers, ensure_ascii=False)}")
-        _log(f"[{tag}] resp_body_len={len(body.encode('utf-8', errors='replace'))}")
+        _log_error(
+            f"[{tag}] resp_headers_focus="
+            f"{json.dumps(focus, ensure_ascii=False) if focus else '(none matched)'}"
+        )
+        _log_error(f"[{tag}] resp_headers_all={json.dumps(headers, ensure_ascii=False)}")
+        _log_error(f"[{tag}] resp_body_len={len(body.encode('utf-8', errors='replace'))}")
         if body:
-            _log(f"[{tag}] resp_body={body}")
+            _log_error(f"[{tag}] resp_body={body}")
         else:
-            _log(f"[{tag}] resp_body=(empty)")
+            _log_error(f"[{tag}] resp_body=(empty)")
         if parsed is not None:
-            _log(f"[{tag}] resp_json={json.dumps(parsed, ensure_ascii=False)}")
+            _log_error(f"[{tag}] resp_json={json.dumps(parsed, ensure_ascii=False)}")
         blob = (body + " " + json.dumps(headers, ensure_ascii=False)).lower()
         hints = []
         for kw in (
@@ -388,8 +499,8 @@ class DouyinPublisher:
                 hints.append(kw)
         if not body and response.status_code == 403:
             hints.append("empty_403_likely_waf_or_secsdk")
-        _log(f"[{tag}] risk_hints={hints or ['(none)']}")
-        _log("=" * 60)
+        _log_error(f"[{tag}] risk_hints={hints or ['(none)']}")
+        _log_error("=" * 60)
 
     def _creator_url(
         self,
@@ -561,6 +672,14 @@ class DouyinPublisher:
             "无法自动获取 user_id，请在请求里传 user_id="
             "（发布页 ApplyUploadInner 的 user_id / author_id）"
         )
+
+    def check_login(self) -> dict[str, Any]:
+        """用当前实例 Cookie 检测是否登录；成功则缓存 user_id。"""
+        cookie = self.session.headers.get("Cookie") or ""
+        result = check_login(cookie)
+        if result.get("ok") and result.get("user_id") and not self.user_id:
+            self.user_id = str(result["user_id"])
+        return result
 
     # ----- step1: upload auth -----
     def get_upload_auth(self) -> dict[str, Any]:
@@ -759,7 +878,7 @@ class DouyinPublisher:
                 timeout=300,
             )
             r.raise_for_status()
-            if LOG_VERBOSE or part == 1 or part % 5 == 0 or offset + PART_SIZE >= len(data):
+            if logger.isEnabledFor(logging.DEBUG) or part == 1 or part % 5 == 0 or offset + PART_SIZE >= len(data):
                 _log(
                     f"[tos] part {part}/{total_parts} ok "
                     f"({len(chunk)} bytes, crc={crc}, offset={offset})"
@@ -1085,8 +1204,8 @@ class DouyinPublisher:
             f"url={_url_brief(url)}"
         )
         if "msToken=" not in url:
-            _log(
-                "[publish] WARN: create_v2 URL 无 msToken。"
+            _log_warn(
+                "[publish] create_v2 URL 无 msToken。"
                 "浏览器实发必带；这是空 body 403 的高危信号。"
             )
         t0 = time.time()
@@ -1292,7 +1411,7 @@ def load_cookie(path: Path) -> str:
 
 def main() -> int:
     # 直接改这里的参数即可
-    mode = "image"  # "video" | "image"
+    mode = "check"  # "video" | "image" | "check"
     video = "response.mp4"  # 视频文件路径（mode=video）
     images = ["cover.jpg", "cover.jpg", "cover.jpg"]  # 图文图片路径列表（mode=image，最多 35 张）
     image_workers = 4  # 图文并发上传线程数，1=串行，建议 3~8
@@ -1317,17 +1436,43 @@ def main() -> int:
     user_id = ""  # 作者 uid（可选，自动探测失败时必填）
     options_json = ""  # 额外 PublishOptions JSON 文件
 
+    # 命令行：python publish.py --check-login  [可选再跟一段 Cookie]
+    check_args = [a for a in sys.argv[1:] if a in ("--check-login", "check-login", "--check")]
+    if check_args or mode == "check":
+        mode = "check"
+
+    setup_logging()
+
+    if mode == "check":
+        # 优先用命令行传入的 Cookie 文本，否则读 cookies.txt
+        inline = ""
+        for i, a in enumerate(sys.argv[1:]):
+            if a in ("--check-login", "check-login", "--check"):
+                rest = sys.argv[i + 2 :]
+                if rest and not rest[0].startswith("-"):
+                    inline = rest[0]
+                break
+        if inline:
+            cookie = inline.strip()
+        elif cookie_file.is_file():
+            cookie = load_cookie(cookie_file)
+        else:
+            logger.error("请传入 Cookie，或准备 cookies.txt")
+            return 1
+        result = check_login(cookie)
+        logger.info("%s", json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 2
+
     if not cookie_file.is_file():
-        print(
-            f"缺少 {cookie_file}。请从浏览器复制 Cookie 到该文件 "
-            f"（可参考 cookies.example.txt）",
-            file=sys.stderr,
+        logger.error(
+            "缺少 %s。请从浏览器复制 Cookie 到该文件（可参考 cookies.example.txt）",
+            cookie_file,
         )
         return 1
 
     cookie = load_cookie(cookie_file)
     if "sessionid" not in cookie:
-        print("cookies.txt 中未检测到 sessionid，请确认 Cookie 完整", file=sys.stderr)
+        logger.error("cookies.txt 中未检测到 sessionid，请确认 Cookie 完整")
         return 1
 
     opt_data: dict = {}
@@ -1354,10 +1499,14 @@ def main() -> int:
     options.music_source = music_source
 
     sdk_path = Path(security_sdk)
+    sdk_data: Optional[dict[str, Any]] = None
+    if sdk_path.is_file():
+        sdk_data = json.loads(sdk_path.read_text(encoding="utf-8"))
+
     pub = DouyinPublisher(
         cookie=cookie,
         user_id=user_id,
-        security_sdk=sdk_path if sdk_path.is_file() else None,
+        security_sdk=sdk_data,
     )
     if music_pick_recommend and not options.music_id:
         picked = pub.pick_recommend_music(music_pick_index)
@@ -1375,7 +1524,7 @@ def main() -> int:
         )
     else:
         result = pub.publish(Path(video), options, cover_path)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    logger.info("publish result:\n%s", json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
